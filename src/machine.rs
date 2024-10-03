@@ -7,13 +7,14 @@ use std::collections::hash_map::Entry;
 use std::path::Path;
 use std::{fmt, process};
 
+use either::Either;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rustc_attr::InlineAttr;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 #[allow(unused)]
 use rustc_data_structures::static_assert_size;
-use rustc_middle::mir;
+use rustc_middle::mir::{self, TerminatorKind};
 use rustc_middle::query::TyCtxtAt;
 use rustc_middle::ty::layout::{HasTyCtxt, LayoutCx, LayoutError, LayoutOf, TyAndLayout};
 use rustc_middle::ty::{self, Instance, Ty, TyCtxt};
@@ -1463,6 +1464,16 @@ impl<'tcx> Machine<'tcx> for MiriMachine<'tcx> {
     }
 
     fn before_terminator(ecx: &mut InterpCx<'tcx, Self>) -> InterpResult<'tcx> {
+        if let Either::Left(loc) = ecx.frame().current_loc() {
+            let basic_block = &ecx.body().basic_blocks[loc.block];
+            if let Some(terminator) = &basic_block.terminator
+                && let TerminatorKind::Call { func, .. } = &terminator.kind
+                && let ty::FnDef(def_id, _) = func.ty(ecx.body(), ecx.tcx()).kind()
+                && ecx.tcx().def_path_str(def_id).contains("inspect")
+            {
+                print_frame(ecx);
+            }
+        }
         ecx.machine.basic_block_count += 1u64; // a u64 that is only incremented by 1 will "never" overflow
         ecx.machine.since_gc += 1;
         // Possibly report our progress.
@@ -1512,7 +1523,7 @@ impl<'tcx> Machine<'tcx> for MiriMachine<'tcx> {
         if ecx.machine.borrow_tracker.is_some() {
             ecx.on_stack_pop(frame)?;
         }
-        // tracing-tree can autoamtically annotate scope changes, but it gets very confused by our
+        // tracing-tree can automatically annotate scope changes, but it gets very confused by our
         // concurrency and what it prints is just plain wrong. So we print our own information
         // instead. (Cc https://github.com/rust-lang/miri/issues/2266)
         info!("Leaving {}", ecx.frame().instance());
@@ -1664,5 +1675,26 @@ impl<'tcx> Machine<'tcx> for MiriMachine<'tcx> {
         compute_range: impl FnOnce() -> RangeSet,
     ) -> Cow<'e, RangeSet> {
         Cow::Borrowed(ecx.machine.union_data_ranges.entry(ty).or_insert_with(compute_range))
+    }
+}
+
+struct LocalsPrinter<'a, 'tcx> {
+    ecx: &'a InterpCx<'tcx, MiriMachine<'tcx>>,
+}
+
+fn print_frame<'tcx>(ecx: &InterpCx<'tcx, MiriMachine<'tcx>>) {
+    eprintln!("{:?}", LocalsPrinter { ecx });
+}
+
+impl std::fmt::Debug for LocalsPrinter<'_, '_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "───────────────────────────────────────────────────────────────────────────")?;
+        for local in self.ecx.frame().locals.indices() {
+            if let Ok(place) = self.ecx.local_to_place(local) {
+                writeln!(f, "{:?}", self.ecx.dump_place(&place))?;
+            }
+        }
+        writeln!(f, "───────────────────────────────────────────────────────────────────────────")?;
+        Ok(())
     }
 }
